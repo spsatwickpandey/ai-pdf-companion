@@ -1,0 +1,1872 @@
+'use client'
+
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { usePDF } from '../contexts/PDFContext'
+import { PDFDocumentProxy } from 'pdfjs-dist/types/src/display/api'
+import PDFToolbar from './PDFToolbar'
+import PDFSidebar from './PDFSidebar'
+
+// Initialize PDF.js with proper types
+let pdfjsLib: typeof import('pdfjs-dist/legacy/build/pdf') | null = null
+if (typeof window !== 'undefined') {
+  import('pdfjs-dist/legacy/build/pdf').then((module) => {
+    pdfjsLib = module
+    pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js'
+  })
+}
+
+interface PDFEditorProps {
+  activeTool: string
+  onToolChange?: (tool: string) => void
+  selectedAnnotation?: any
+  onUpdateAnnotation?: (annotation: any) => void
+}
+
+type ViewMode = 'single' | 'continuous' | 'facing'
+type ZoomMode = 'fit-width' | 'fit-page' | 'custom'
+
+interface AIResponse {
+  text: string;
+  pageNumber: number;
+  confidence: number;
+}
+
+interface PDFContent {
+  data: ArrayBuffer;
+  filename: string;
+}
+
+interface TextItem {
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  isImage: boolean;
+}
+
+// Annotation types
+interface AnnotationBase {
+  id: string;
+  page: number;
+  type: 'text' | 'draw' | 'rect' | 'circle' | 'line' | 'image' | 'highlight' | 'comment';
+}
+
+interface TextAnnotation extends AnnotationBase {
+  type: 'text';
+  x: number;
+  y: number;
+  text: string;
+  fontSize: number;
+  fontFamily: string;
+  color: string;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+}
+
+interface DrawAnnotation extends AnnotationBase {
+  type: 'draw';
+  points: { x: number; y: number }[];
+  color: string;
+  width: number;
+}
+
+interface RectAnnotation extends AnnotationBase {
+  type: 'rect';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color: string;
+  borderWidth: number;
+  fill?: string;
+}
+
+interface CircleAnnotation extends AnnotationBase {
+  type: 'circle';
+  cx: number;
+  cy: number;
+  r: number;
+  color: string;
+  borderWidth: number;
+  fill?: string;
+}
+
+interface LineAnnotation extends AnnotationBase {
+  type: 'line';
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  color: string;
+  width: number;
+}
+
+interface ImageAnnotation extends AnnotationBase {
+  type: 'image';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  src: string;
+}
+
+interface HighlightAnnotation extends AnnotationBase {
+  type: 'highlight';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color: string;
+  opacity: number;
+}
+
+interface CommentAnnotation extends AnnotationBase {
+  type: 'comment';
+  x: number;
+  y: number;
+  text: string;
+}
+
+type Annotation =
+  | TextAnnotation
+  | DrawAnnotation
+  | RectAnnotation
+  | CircleAnnotation
+  | LineAnnotation
+  | ImageAnnotation
+  | HighlightAnnotation
+  | CommentAnnotation;
+
+export default function PDFEditor({ activeTool, onToolChange, selectedAnnotation: externalSelectedAnnotation, onUpdateAnnotation: externalUpdateAnnotation }: PDFEditorProps) {
+  // Core state
+  const [currentPage, setCurrentPage] = useState(1)
+  const [totalPages, setTotalPages] = useState(0)
+  const [pdfDoc, setPdfDoc] = useState<any>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [loadingProgress, setLoadingProgress] = useState(0)
+  
+  // View state
+  const [scale, setScale] = useState(1.0)
+  const [viewMode, setViewMode] = useState<ViewMode>('single')
+  const [zoomMode, setZoomMode] = useState<ZoomMode>('fit-width')
+  const [rotation, setRotation] = useState(0)
+  
+  // Refs
+  const containerRef = useRef<HTMLDivElement>(null)
+  const pageRendering = useRef(false)
+  
+  // AI Response state
+  const [aiResponses, setAIResponses] = useState<AIResponse[]>([])
+  const [selectedText, setSelectedText] = useState('')
+  const [isProcessing, setIsProcessing] = useState(false)
+
+  // OCR state
+  const [isOcrProcessing, setIsOcrProcessing] = useState(false)
+  const [ocrProgress, setOcrProgress] = useState(0)
+
+  // Annotation state
+  const [annotations, setAnnotations] = useState<Annotation[]>([])
+  const [activeAnnotation, setActiveAnnotation] = useState<Annotation | null>(null)
+  const [isDrawing, setIsDrawing] = useState(false)
+
+  // Undo/Redo state
+  const [annotationHistory, setAnnotationHistory] = useState<Annotation[][]>([])
+  const [historyIndex, setHistoryIndex] = useState(-1)
+
+  // Annotation selection state
+  const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null)
+
+  // Track if update is from external source to avoid infinite loops
+  const isExternalUpdate = useRef(false)
+
+  // Sync external selected annotation with internal state
+  useEffect(() => {
+    if (externalSelectedAnnotation && !isExternalUpdate.current) {
+      setSelectedAnnotationId(externalSelectedAnnotation.id)
+      // Update the annotation in the internal annotations array
+      const updatedAnnotations = annotations.map(a => 
+        a.id === externalSelectedAnnotation.id ? externalSelectedAnnotation : a
+      )
+      setAnnotations(updatedAnnotations)
+      // Save to history for undo/redo
+      saveToHistory(updatedAnnotations)
+    } else if (!externalSelectedAnnotation) {
+      setSelectedAnnotationId(null)
+    }
+  }, [externalSelectedAnnotation])
+
+  // Moving state
+  const [isMoving, setIsMoving] = useState(false)
+  const moveOffset = useRef<{ x: number; y: number }>({ x: 0, y: 0 })
+
+  // Resizing state (extend logic for circle and image)
+  const [isResizing, setIsResizing] = useState<null | { handle: string }> (null)
+
+  // Select annotation on click
+  const handleAnnotationClick = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation()
+    setSelectedAnnotationId(id)
+    const annotation = annotations.find(a => a.id === id)
+    if (annotation && externalUpdateAnnotation) {
+      externalUpdateAnnotation(annotation)
+    }
+  }
+
+  // Keyboard shortcuts for undo/redo and delete
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === 'z' && !e.shiftKey) {
+          e.preventDefault()
+          undo()
+        } else if ((e.key === 'y') || (e.key === 'z' && e.shiftKey)) {
+          e.preventDefault()
+          redo()
+        }
+      } else if (e.key === 'Delete' && selectedAnnotationId) {
+        const newAnnotations = annotations.filter(a => a.id !== selectedAnnotationId)
+        setAnnotations(newAnnotations)
+        saveToHistory(newAnnotations)
+        setSelectedAnnotationId(null)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [selectedAnnotationId, historyIndex, annotationHistory, annotations])
+
+  // Drawing tool logic
+  const handleAnnotationPointerDown = (e: React.PointerEvent) => {
+    // Prevent new shape if already drawing/resizing/moving or if activeAnnotation exists
+    if (isDrawing || isResizing || isMoving || activeAnnotation) return
+    
+    if (activeTool === 'text') {
+      const svg = e.currentTarget as SVGSVGElement
+      const rect = svg.getBoundingClientRect()
+      const x = (e.clientX - rect.left)
+      const y = (e.clientY - rect.top)
+      
+      const text = prompt('Enter text:')
+      if (text) {
+        const newText: TextAnnotation = {
+          id: `text-${Date.now()}`,
+          page: currentPage,
+          type: 'text',
+          x,
+          y,
+          text,
+          fontSize: 16,
+          fontFamily: 'Arial',
+          color: '#000000',
+          bold: false,
+          italic: false,
+          underline: false
+        }
+        const newAnnotations = [...annotations, newText]
+        setAnnotations(newAnnotations)
+        saveToHistory(newAnnotations)
+      }
+    } else if (activeTool === 'image') {
+      const svg = e.currentTarget as SVGSVGElement
+      const rect = svg.getBoundingClientRect()
+      const x = (e.clientX - rect.left)
+      const y = (e.clientY - rect.top)
+      
+      const input = document.createElement('input')
+      input.type = 'file'
+      input.accept = 'image/*'
+      input.onchange = (event) => {
+        const file = (event.target as HTMLInputElement).files?.[0]
+        if (file) {
+          const reader = new FileReader()
+          reader.onload = (e) => {
+            const newImage: ImageAnnotation = {
+              id: `image-${Date.now()}`,
+              page: currentPage,
+              type: 'image',
+              x,
+              y,
+              width: 200,
+              height: 150,
+              src: e.target?.result as string
+            }
+            const newAnnotations = [...annotations, newImage]
+            setAnnotations(newAnnotations)
+            saveToHistory(newAnnotations)
+          }
+          reader.readAsDataURL(file)
+        }
+      }
+      input.click()
+    } else if (activeTool === 'comment') {
+      const svg = e.currentTarget as SVGSVGElement
+      const rect = svg.getBoundingClientRect()
+      const x = (e.clientX - rect.left)
+      const y = (e.clientY - rect.top)
+      
+      const comment = prompt('Enter comment:')
+      if (comment) {
+        const newComment: CommentAnnotation = {
+          id: `comment-${Date.now()}`,
+          page: currentPage,
+          type: 'comment',
+          x,
+          y,
+          text: comment
+        }
+        const newAnnotations = [...annotations, newComment]
+        setAnnotations(newAnnotations)
+        saveToHistory(newAnnotations)
+      }
+    } else if (activeTool === 'highlight') {
+      const svg = e.currentTarget as SVGSVGElement
+      const rect = svg.getBoundingClientRect()
+      const x = (e.clientX - rect.left)
+      const y = (e.clientY - rect.top)
+      setIsDrawing(true)
+      const newHighlight: HighlightAnnotation = {
+        id: `highlight-${Date.now()}`,
+        page: currentPage,
+        type: 'highlight',
+        x,
+        y,
+        width: 0,
+        height: 0,
+        color: '#ffff00',
+        opacity: 0.3
+      }
+      setActiveAnnotation(newHighlight)
+    } else if (activeTool === 'rect') {
+      // Rectangle logic
+      const svg = e.currentTarget as SVGSVGElement
+      const rect = svg.getBoundingClientRect()
+      const x = (e.clientX - rect.left)
+      const y = (e.clientY - rect.top)
+      setIsDrawing(true)
+      const newRect: RectAnnotation = {
+        id: `rect-${Date.now()}`,
+        page: currentPage,
+        type: 'rect',
+        x,
+        y,
+        width: 0,
+        height: 0,
+        color: '#1976d2',
+        borderWidth: 2,
+        fill: 'rgba(25, 118, 210, 0.1)'
+      }
+      setActiveAnnotation(newRect)
+    } else if (activeTool === 'draw') {
+      // Draw logic
+      const svg = e.currentTarget as SVGSVGElement
+      const rect = svg.getBoundingClientRect()
+      const x = (e.clientX - rect.left)
+      const y = (e.clientY - rect.top)
+      setIsDrawing(true)
+      const newDraw: DrawAnnotation = {
+        id: `draw-${Date.now()}`,
+        page: currentPage,
+        type: 'draw',
+        points: [{ x, y }],
+        color: '#d32f2f',
+        width: 3
+      }
+      setActiveAnnotation(newDraw)
+    } else if (activeTool === 'line') {
+      // Line logic
+      const svg = e.currentTarget as SVGSVGElement
+      const rect = svg.getBoundingClientRect()
+      const x = (e.clientX - rect.left)
+      const y = (e.clientY - rect.top)
+      setIsDrawing(true)
+      const newLine: LineAnnotation = {
+        id: `line-${Date.now()}`,
+        page: currentPage,
+        type: 'line',
+        x1: x,
+        y1: y,
+        x2: x,
+        y2: y,
+        color: '#43a047',
+        width: 3
+      }
+      setActiveAnnotation(newLine)
+    } else if (activeTool === 'circle') {
+      // Circle logic
+      const svg = e.currentTarget as SVGSVGElement
+      const rect = svg.getBoundingClientRect()
+      const x = (e.clientX - rect.left)
+      const y = (e.clientY - rect.top)
+      setIsDrawing(true)
+      const newCircle: CircleAnnotation = {
+        id: `circle-${Date.now()}`,
+        page: currentPage,
+        type: 'circle',
+        cx: x,
+        cy: y,
+        r: 0,
+        color: '#fbc02d',
+        borderWidth: 2,
+        fill: 'rgba(251, 192, 45, 0.1)'
+      }
+      setActiveAnnotation(newCircle)
+    }
+  }
+
+  const handleAnnotationPointerMove = (e: React.PointerEvent) => {
+    if (!isDrawing || !activeAnnotation) return
+    const svg = e.currentTarget as SVGSVGElement
+    const rect = svg.getBoundingClientRect()
+    const x = (e.clientX - rect.left)
+    const y = (e.clientY - rect.top)
+    if (activeTool === 'rect' && activeAnnotation.type === 'rect') {
+      const width = x - activeAnnotation.x
+      const height = y - activeAnnotation.y
+      setActiveAnnotation({ ...activeAnnotation, width, height })
+    } else if (activeTool === 'draw' && activeAnnotation.type === 'draw') {
+      setActiveAnnotation({
+        ...activeAnnotation,
+        points: [...activeAnnotation.points, { x, y }]
+      })
+    } else if (activeTool === 'highlight' && activeAnnotation.type === 'highlight') {
+      const width = x - activeAnnotation.x
+      const height = y - activeAnnotation.y
+      setActiveAnnotation({ ...activeAnnotation, width, height })
+    } else if (activeTool === 'line' && activeAnnotation.type === 'line') {
+      setActiveAnnotation({ ...activeAnnotation, x2: x, y2: y })
+    } else if (activeTool === 'circle' && activeAnnotation.type === 'circle') {
+      const dx = x - activeAnnotation.cx
+      const dy = y - activeAnnotation.cy
+      const r = Math.sqrt(dx * dx + dy * dy)
+      setActiveAnnotation({ ...activeAnnotation, r })
+    }
+  }
+
+  const handleAnnotationPointerUp = (e: React.PointerEvent) => {
+    if (!isDrawing || !activeAnnotation) return
+    setIsDrawing(false)
+    if (activeTool === 'rect' && activeAnnotation.type === 'rect') {
+      if (Math.abs(activeAnnotation.width) > 5 && Math.abs(activeAnnotation.height) > 5) {
+        const newAnnotations = [...annotations, activeAnnotation]
+        setAnnotations(newAnnotations)
+        saveToHistory(newAnnotations)
+      }
+      setActiveAnnotation(null)
+    } else if (activeTool === 'draw' && activeAnnotation.type === 'draw') {
+      if (activeAnnotation.points.length > 2) {
+        const newAnnotations = [...annotations, activeAnnotation]
+        setAnnotations(newAnnotations)
+        saveToHistory(newAnnotations)
+      }
+      setActiveAnnotation(null)
+    } else if (activeTool === 'highlight' && activeAnnotation.type === 'highlight') {
+      if (Math.abs(activeAnnotation.width) > 5 && Math.abs(activeAnnotation.height) > 5) {
+        const newAnnotations = [...annotations, activeAnnotation]
+        setAnnotations(newAnnotations)
+        saveToHistory(newAnnotations)
+      }
+      setActiveAnnotation(null)
+    } else if (activeTool === 'line' && activeAnnotation.type === 'line') {
+      if (Math.abs(activeAnnotation.x2 - activeAnnotation.x1) > 5 || Math.abs(activeAnnotation.y2 - activeAnnotation.y1) > 5) {
+        const newAnnotations = [...annotations, activeAnnotation]
+        setAnnotations(newAnnotations)
+        saveToHistory(newAnnotations)
+      }
+      setActiveAnnotation(null)
+    } else if (activeTool === 'circle' && activeAnnotation.type === 'circle') {
+      if (activeAnnotation.r > 5) {
+        const newAnnotations = [...annotations, activeAnnotation]
+        setAnnotations(newAnnotations)
+        saveToHistory(newAnnotations)
+      }
+      setActiveAnnotation(null)
+    }
+  }
+
+  // Start moving on mousedown on selected annotation
+  const handleAnnotationMouseDown = (e: React.MouseEvent, a: Annotation) => {
+    if (a.id !== selectedAnnotationId) return
+    e.stopPropagation()
+    setIsMoving(true)
+    if ('x' in a && 'y' in a) {
+      moveOffset.current = { x: e.clientX - a.x, y: e.clientY - a.y }
+    } else if ('cx' in a && 'cy' in a) {
+      moveOffset.current = { x: e.clientX - a.cx, y: e.clientY - a.cy }
+    } else if ('x1' in a && 'y1' in a && 'x2' in a && 'y2' in a) {
+      moveOffset.current = { x: e.clientX - a.x1, y: e.clientY - a.y1 }
+    } else {
+      moveOffset.current = { x: 0, y: 0 }
+    }
+  }
+
+  // Move annotation on mouse move
+  useEffect(() => {
+    if (!isMoving || !selectedAnnotationId) return
+    const handleMouseMove = (e: MouseEvent) => {
+      setAnnotations(prev => prev.map(a => {
+        if (a.id !== selectedAnnotationId) return a
+        if (a.type === 'rect' || a.type === 'highlight' || a.type === 'image' || a.type === 'comment' || a.type === 'text') {
+          return { ...a, x: e.clientX - moveOffset.current.x, y: e.clientY - moveOffset.current.y }
+        } else if (a.type === 'circle') {
+          return { ...a, cx: e.clientX - moveOffset.current.x, cy: e.clientY - moveOffset.current.y }
+        } else if (a.type === 'line') {
+          const dx = e.clientX - moveOffset.current.x - a.x1
+          const dy = e.clientY - moveOffset.current.y - a.y1
+          return { ...a, x1: a.x1 + dx, y1: a.y1 + dy, x2: a.x2 + dx, y2: a.y2 + dy }
+        } else if (a.type === 'draw') {
+          const dx = e.clientX - moveOffset.current.x - a.points[0].x
+          const dy = e.clientY - moveOffset.current.y - a.points[0].y
+          return { ...a, points: a.points.map(p => ({ x: p.x + dx, y: p.y + dy })) }
+        }
+        return a
+      }))
+    }
+    const handleMouseUp = () => setIsMoving(false)
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [isMoving, selectedAnnotationId])
+
+  // Extend resizing logic for highlights and lines
+  useEffect(() => {
+    if (!isResizing || !selectedAnnotationId) return
+    const handleMouseMove = (e: MouseEvent) => {
+      setAnnotations(prev => prev.map(a => {
+        if (a.id !== selectedAnnotationId) return a
+        // Rectangle resizing
+        if (a.type === 'rect') {
+          let { x, y, width, height } = a
+          const mouseX = e.clientX
+          const mouseY = e.clientY
+          const svg = document.querySelector('svg')
+          if (!svg) return a
+          const svgRect = svg.getBoundingClientRect()
+          const localX = mouseX - svgRect.left
+          const localY = mouseY - svgRect.top
+          switch (isResizing.handle) {
+            case 'nw': width = width + (x - localX); height = height + (y - localY); x = localX; y = localY; break;
+            case 'ne': width = localX - x; height = height + (y - localY); y = localY; break;
+            case 'sw': width = width + (x - localX); x = localX; height = localY - y; break;
+            case 'se': width = localX - x; height = localY - y; break;
+            case 'n': height = height + (y - localY); y = localY; break;
+            case 's': height = localY - y; break;
+            case 'w': width = width + (x - localX); x = localX; break;
+            case 'e': width = localX - x; break;
+          }
+          width = Math.max(5, width)
+          height = Math.max(5, height)
+          return { ...a, x, y, width, height }
+        }
+        // Circle resizing
+        if (a.type === 'circle') {
+          let { cx, cy, r } = a
+          const mouseX = e.clientX
+          const mouseY = e.clientY
+          const svg = document.querySelector('svg')
+          if (!svg) return a
+          const svgRect = svg.getBoundingClientRect()
+          const localX = mouseX - svgRect.left
+          const localY = mouseY - svgRect.top
+          const newR = Math.sqrt(Math.pow(localX - cx, 2) + Math.pow(localY - cy, 2))
+          return { ...a, r: Math.max(5, newR) }
+        }
+        // Image resizing (same as rect)
+        if (a.type === 'image') {
+          let { x, y, width, height } = a
+          const mouseX = e.clientX
+          const mouseY = e.clientY
+          const svg = document.querySelector('svg')
+          if (!svg) return a
+          const svgRect = svg.getBoundingClientRect()
+          const localX = mouseX - svgRect.left
+          const localY = mouseY - svgRect.top
+          switch (isResizing.handle) {
+            case 'nw': width = width + (x - localX); height = height + (y - localY); x = localX; y = localY; break;
+            case 'ne': width = localX - x; height = height + (y - localY); y = localY; break;
+            case 'sw': width = width + (x - localX); x = localX; height = localY - y; break;
+            case 'se': width = localX - x; height = localY - y; break;
+            case 'n': height = height + (y - localY); y = localY; break;
+            case 's': height = localY - y; break;
+            case 'w': width = width + (x - localX); x = localX; break;
+            case 'e': width = localX - x; break;
+          }
+          width = Math.max(5, width)
+          height = Math.max(5, height)
+          return { ...a, x, y, width, height }
+        }
+        // Highlight resizing (same as rect)
+        if (a.type === 'highlight') {
+          let { x, y, width, height } = a
+          const mouseX = e.clientX
+          const mouseY = e.clientY
+          const svg = document.querySelector('svg')
+          if (!svg) return a
+          const svgRect = svg.getBoundingClientRect()
+          const localX = mouseX - svgRect.left
+          const localY = mouseY - svgRect.top
+          switch (isResizing.handle) {
+            case 'nw': width = width + (x - localX); height = height + (y - localY); x = localX; y = localY; break;
+            case 'ne': width = localX - x; height = height + (y - localY); y = localY; break;
+            case 'sw': width = width + (x - localX); x = localX; height = localY - y; break;
+            case 'se': width = localX - x; height = localY - y; break;
+            case 'n': height = height + (y - localY); y = localY; break;
+            case 's': height = localY - y; break;
+            case 'w': width = width + (x - localX); x = localX; break;
+            case 'e': width = localX - x; break;
+          }
+          width = Math.max(5, width)
+          height = Math.max(5, height)
+          return { ...a, x, y, width, height }
+        }
+        // Line resizing (move endpoints)
+        if (a.type === 'line') {
+          const svg = document.querySelector('svg')
+          if (!svg) return a
+          const svgRect = svg.getBoundingClientRect()
+          const mouseX = e.clientX - svgRect.left
+          const mouseY = e.clientY - svgRect.top
+          if (isResizing.handle === 'start') {
+            return { ...a, x1: mouseX, y1: mouseY }
+          } else if (isResizing.handle === 'end') {
+            return { ...a, x2: mouseX, y2: mouseY }
+          }
+        }
+        return a
+      }))
+    }
+    const handleMouseUp = () => setIsResizing(null)
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [isResizing, selectedAnnotationId])
+
+  // Resizing logic for circles
+  useEffect(() => {
+    if (!isResizing || !selectedAnnotationId) return
+    const handleMouseMove = (e: MouseEvent) => {
+      setAnnotations(prev => prev.map(a => {
+        if (a.id !== selectedAnnotationId || a.type !== 'circle') return a
+        const svg = document.querySelector('svg')
+        if (!svg) return a
+        const svgRect = svg.getBoundingClientRect()
+        const mouseX = e.clientX - svgRect.left
+        const mouseY = e.clientY - svgRect.top
+        const dx = mouseX - a.cx
+        const dy = mouseY - a.cy
+        const r = Math.max(5, Math.sqrt(dx * dx + dy * dy))
+        return { ...a, r }
+      }))
+    }
+    const handleMouseUp = () => setIsResizing(null)
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [isResizing, selectedAnnotationId])
+
+  // Resizing logic for images
+  useEffect(() => {
+    if (!isResizing || !selectedAnnotationId) return
+    const handleMouseMove = (e: MouseEvent) => {
+      setAnnotations(prev => prev.map(a => {
+        if (a.id !== selectedAnnotationId || a.type !== 'image') return a
+        let { x, y, width, height } = a
+        const mouseX = e.clientX
+        const mouseY = e.clientY
+        const svg = document.querySelector('svg')
+        if (!svg) return a
+        const svgRect = svg.getBoundingClientRect()
+        const localX = mouseX - svgRect.left
+        const localY = mouseY - svgRect.top
+        switch (isResizing.handle) {
+          case 'nw': width = width + (x - localX); height = height + (y - localY); x = localX; y = localY; break;
+          case 'ne': width = localX - x; height = height + (y - localY); y = localY; break;
+          case 'sw': width = width + (x - localX); x = localX; height = localY - y; break;
+          case 'se': width = localX - x; height = localY - y; break;
+          case 'n': height = height + (y - localY); y = localY; break;
+          case 's': height = localY - y; break;
+          case 'w': width = width + (x - localX); x = localX; break;
+          case 'e': width = localX - x; break;
+        }
+        width = Math.max(5, width)
+        height = Math.max(5, height)
+        return { ...a, x, y, width, height }
+      }))
+    }
+    const handleMouseUp = () => setIsResizing(null)
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [isResizing, selectedAnnotationId])
+
+  // Start resizing on mousedown on a handle
+  const handleResizeMouseDown = (e: React.MouseEvent, handle: string) => {
+    e.stopPropagation()
+    setIsResizing({ handle })
+  }
+
+  const { selectedPDF, getPDFContent } = usePDF()
+
+  // Get selected annotation for sidebar
+  const selectedAnnotation = annotations.find(a => a.id === selectedAnnotationId)
+
+  // Save state to history for undo/redo
+  const saveToHistory = (newAnnotations: Annotation[]) => {
+    const newHistory = annotationHistory.slice(0, historyIndex + 1)
+    newHistory.push([...newAnnotations])
+    setAnnotationHistory(newHistory)
+    setHistoryIndex(newHistory.length - 1)
+  }
+
+  // Undo function
+  const undo = () => {
+    if (historyIndex > 0) {
+      const newIndex = historyIndex - 1
+      setHistoryIndex(newIndex)
+      setAnnotations([...annotationHistory[newIndex]])
+    }
+  }
+
+  // Redo function
+  const redo = () => {
+    if (historyIndex < annotationHistory.length - 1) {
+      const newIndex = historyIndex + 1
+      setHistoryIndex(newIndex)
+      setAnnotations([...annotationHistory[newIndex]])
+    }
+  }
+
+  // Update annotation function for sidebar
+  const updateAnnotation = (updatedAnnotation: any) => {
+    if (updatedAnnotation === null) {
+      // Delete annotation
+      const newAnnotations = annotations.filter(a => a.id !== selectedAnnotationId)
+      setAnnotations(newAnnotations)
+      saveToHistory(newAnnotations)
+      setSelectedAnnotationId(null)
+      if (externalUpdateAnnotation) {
+        isExternalUpdate.current = true
+        externalUpdateAnnotation(null)
+        isExternalUpdate.current = false
+      }
+    } else {
+      // Update annotation
+      const newAnnotations = annotations.map(a => 
+        a.id === selectedAnnotationId ? updatedAnnotation : a
+      )
+      setAnnotations(newAnnotations)
+      saveToHistory(newAnnotations)
+      if (externalUpdateAnnotation) {
+        isExternalUpdate.current = true
+        externalUpdateAnnotation(updatedAnnotation)
+        isExternalUpdate.current = false
+      }
+    }
+  }
+
+  // Save and export functionality
+  const saveAnnotations = () => {
+    if (!selectedPDF) return
+    const data = {
+      annotations,
+      pdfId: selectedPDF,
+      timestamp: new Date().toISOString()
+    }
+    localStorage.setItem(`pdf-annotations-${selectedPDF}`, JSON.stringify(data))
+    alert('Annotations saved successfully!')
+  }
+
+  const exportAnnotations = () => {
+    if (!selectedPDF) return
+    const data = {
+      annotations,
+      pdfId: selectedPDF,
+      timestamp: new Date().toISOString()
+    }
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `annotations-${selectedPDF}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  // Load saved annotations when PDF changes
+  useEffect(() => {
+    if (selectedPDF) {
+      const saved = localStorage.getItem(`pdf-annotations-${selectedPDF}`)
+      if (saved) {
+        try {
+          const data = JSON.parse(saved)
+          const loadedAnnotations = data.annotations || []
+          setAnnotations(loadedAnnotations)
+          // Initialize history with loaded annotations
+          setAnnotationHistory([loadedAnnotations])
+          setHistoryIndex(0)
+        } catch (error) {
+          console.error('Failed to load annotations:', error)
+          setAnnotations([])
+          setAnnotationHistory([[]])
+          setHistoryIndex(0)
+        }
+      } else {
+        setAnnotations([])
+        setAnnotationHistory([[]])
+        setHistoryIndex(0)
+      }
+    }
+  }, [selectedPDF])
+
+  // Listen for save/export events from dashboard
+  useEffect(() => {
+    const handleSaveAnnotations = () => saveAnnotations()
+    const handleExportAnnotations = () => exportAnnotations()
+    
+    window.addEventListener('saveAnnotations', handleSaveAnnotations)
+    window.addEventListener('exportAnnotations', handleExportAnnotations)
+    
+    return () => {
+      window.removeEventListener('saveAnnotations', handleSaveAnnotations)
+      window.removeEventListener('exportAnnotations', handleExportAnnotations)
+    }
+  }, [annotations, selectedPDF])
+
+  // Load PDF document with improved handling
+  useEffect(() => {
+    const loadPDF = async () => {
+      if (!selectedPDF || !pdfjsLib) {
+        setLoading(false)
+        return
+      }
+
+      try {
+        setLoading(true)
+        setError(null)
+        const content = await getPDFContent(selectedPDF)
+        
+        // Validate ArrayBuffer
+        if (!(content instanceof ArrayBuffer)) {
+          throw new Error('Invalid PDF content: Expected ArrayBuffer')
+        }
+
+        // Convert ArrayBuffer to Uint8Array with validation
+        const uint8Array = new Uint8Array(content)
+        if (uint8Array.length === 0) {
+          throw new Error('Empty PDF content')
+        }
+
+        // Load PDF with enhanced configuration
+        const loadingTask = pdfjsLib.getDocument({
+          data: uint8Array
+        })
+
+        // Add progress handler
+        if ('onProgress' in loadingTask) {
+          loadingTask.onProgress = (progressData: { loaded: number; total: number }) => {
+            if (progressData.total > 0) {
+              const percent = Math.round((progressData.loaded / progressData.total) * 100)
+              setLoadingProgress(percent)
+            }
+          }
+        }
+
+        const pdf = await loadingTask.promise
+        
+        // Validate PDF document
+        if (!pdf || !pdf.numPages) {
+          throw new Error('Invalid PDF document')
+        }
+
+        setPdfDoc(pdf)
+        setTotalPages(pdf.numPages)
+        setCurrentPage(1)
+        
+        // Log document info
+        console.log('PDF Info:', {
+          pages: pdf.numPages,
+          numPages: pdf.numPages
+        })
+      } catch (error) {
+        console.error('Error loading PDF:', error)
+        setError(error instanceof Error ? error.message : 'Failed to load PDF document')
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    loadPDF()
+  }, [selectedPDF, getPDFContent])
+
+  // Handle view mode changes
+  const handleViewModeChange = useCallback((mode: ViewMode) => {
+    setViewMode(mode)
+    if (containerRef.current) {
+      switch (mode) {
+        case 'continuous':
+          containerRef.current.style.height = 'auto'
+          break
+        case 'facing':
+          // TODO: Implement facing page view
+          break
+        default:
+          containerRef.current.style.height = '100%'
+      }
+    }
+  }, [])
+
+  // Handle zoom changes
+  const handleZoom = useCallback((newScale: number) => {
+    setZoomMode('custom')
+    const clampedScale = Math.max(0.1, Math.min(5, newScale))
+    setScale(clampedScale)
+  }, [])
+
+  // Handle zoom mode changes
+  const handleZoomMode = useCallback((mode: ZoomMode) => {
+    setZoomMode(mode)
+    if (containerRef.current) {
+      const containerWidth = containerRef.current.clientWidth
+      const containerHeight = containerRef.current.clientHeight
+      const pdfWidth = 612 // Standard PDF width
+      const pdfHeight = 792 // Standard PDF height
+
+      switch (mode) {
+        case 'fit-width':
+          setScale(containerWidth / pdfWidth)
+          break
+        case 'fit-page':
+          const scaleWidth = containerWidth / pdfWidth
+          const scaleHeight = containerHeight / pdfHeight
+          setScale(Math.min(scaleWidth, scaleHeight))
+          break
+        default:
+          // Keep current scale
+          break
+      }
+    }
+  }, [])
+
+  // Page navigation
+  const handlePageChange = useCallback((newPage: number) => {
+    if (newPage >= 1 && newPage <= totalPages) {
+      setCurrentPage(newPage)
+    }
+  }, [totalPages])
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        switch (e.key) {
+          case '+':
+            handleZoom(scale + 0.1)
+            break
+          case '-':
+            handleZoom(scale - 0.1)
+            break
+          case '0':
+            handleZoomMode('fit-width')
+            break
+        }
+      } else {
+        switch (e.key) {
+          case 'ArrowLeft':
+            handlePageChange(currentPage - 1)
+            break
+          case 'ArrowRight':
+            handlePageChange(currentPage + 1)
+            break
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [currentPage, scale, handleZoom, handleZoomMode, handlePageChange])
+
+  // Canvas ref for rendering
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+
+  // Track current render task for cancellation
+  const renderTaskRef = useRef<any>(null)
+
+  // For single page mode: robust render task cancellation
+  useEffect(() => {
+    if (!pdfDoc || !pdfjsLib) return
+    if (viewMode === 'single') {
+      let cancelled = false
+      const renderPage = async () => {
+        if (renderTaskRef.current) {
+          try { renderTaskRef.current.cancel() } catch {}
+          renderTaskRef.current = null
+        }
+        const page = await pdfDoc.getPage(currentPage)
+        const viewport = page.getViewport({ scale, rotation })
+        const canvas = canvasRef.current
+        if (!canvas) return
+        const context = canvas.getContext('2d')
+        if (!context) return
+        canvas.width = viewport.width
+        canvas.height = viewport.height
+        context.clearRect(0, 0, canvas.width, canvas.height)
+        // Cancel any previous render for this canvas
+        if (renderTaskRef.current) {
+          try { renderTaskRef.current.cancel() } catch {}
+          renderTaskRef.current = null
+        }
+        const renderTask = page.render({ canvasContext: context, viewport })
+        renderTaskRef.current = renderTask
+        try {
+          await renderTask.promise
+        } catch (err) {
+          if (
+            typeof err === 'object' &&
+            err !== null &&
+            'name' in err &&
+            typeof (err as any).name === 'string' &&
+            (err as any).name !== 'RenderingCancelledException'
+          ) {
+            throw err;
+          } else if (
+            typeof err === 'object' &&
+            err !== null &&
+            'name' in err &&
+            typeof (err as any).name === 'string' &&
+            (err as any).name === 'RenderingCancelledException'
+          ) {
+            // Suppress RenderingCancelledException
+          } else {
+            throw err;
+          }
+        }
+        if (!cancelled) page.cleanup()
+        renderTaskRef.current = null
+      }
+      renderPage()
+      return () => {
+        cancelled = true
+        if (renderTaskRef.current) {
+          try { renderTaskRef.current.cancel() } catch {}
+          renderTaskRef.current = null
+        }
+      }
+    }
+    // For continuous mode, handled below
+  }, [pdfDoc, currentPage, scale, rotation, viewMode])
+
+  // For continuous mode: robust render task cancellation for each page
+  const [pageCanvases, setPageCanvases] = useState<JSX.Element[]>([])
+  const renderTasksRef = useRef<{ [page: number]: any }>({})
+  const renderIdRef = useRef(0)
+  useEffect(() => {
+    if (!pdfDoc || !pdfjsLib) return
+    if (viewMode !== 'continuous') return
+    renderIdRef.current += 1
+    const currentRenderId = renderIdRef.current
+    let cancelled = false
+    const renderAllPages = async () => {
+      const canvases: JSX.Element[] = []
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const pageNum = i
+        const page = await pdfDoc.getPage(pageNum)
+        const viewport = page.getViewport({ scale, rotation })
+        // Use a ref callback to render each page
+        const refCallback = (canvas: HTMLCanvasElement | null) => {
+          if (canvas && !cancelled && renderIdRef.current === currentRenderId) {
+            const context = canvas.getContext('2d')
+            if (context) {
+              // Ensure canvas is cleared and sized
+              canvas.width = viewport.width
+              canvas.height = viewport.height
+              context.clearRect(0, 0, canvas.width, canvas.height)
+              // Cancel any previous render for this page
+              if (renderTasksRef.current[pageNum]) {
+                try { renderTasksRef.current[pageNum].cancel() } catch {}
+                renderTasksRef.current[pageNum] = null
+              }
+              // Start new render
+              const renderTask = page.render({ canvasContext: context, viewport })
+              renderTasksRef.current[pageNum] = renderTask
+              renderTask.promise.then(() => {
+                if (!cancelled) page.cleanup()
+                renderTasksRef.current[pageNum] = null
+              }).catch((err: any) => {
+                let isRenderingCancelled = false;
+                if (
+                  typeof err === 'object' &&
+                  err !== null &&
+                  'name' in err &&
+                  typeof (err as any).name === 'string'
+                ) {
+                  isRenderingCancelled = ((err as any).name === 'RenderingCancelledException');
+                }
+                if (!isRenderingCancelled) throw err;
+                renderTasksRef.current[pageNum] = null;
+              })
+            }
+          }
+        }
+        // Give each canvas a unique key to avoid DOM reuse issues
+        canvases.push(
+          <div key={`page-canvas-${pageNum}-${scale}-${rotation}-${currentRenderId}`} className="mb-8 flex justify-center" style={{position: 'relative', width: viewport.width, height: viewport.height}}>
+            <canvas ref={refCallback} style={{ background: 'white', borderRadius: 8, boxShadow: '0 0 8px #ccc', position: 'absolute', top: 0, left: 0, width: viewport.width, height: viewport.height, zIndex: 1 }} />
+            {/* SVG annotation overlay for this page */}
+            <svg
+              className="absolute top-0 left-0 pointer-events-auto"
+              style={{ width: viewport.width, height: viewport.height, zIndex: 10 }}
+              width={viewport.width}
+              height={viewport.height}
+              onPointerDown={e => handleAnnotationPointerDownContinuous(e, pageNum, viewport)}
+              onPointerMove={e => handleAnnotationPointerMoveContinuous(e, pageNum, viewport)}
+              onPointerUp={e => handleAnnotationPointerUpContinuous(e, pageNum, viewport)}
+            >
+              {annotations.filter(a => a.page === pageNum).map(a => {
+                const isSelected = a.id === selectedAnnotationId
+                switch (a.type) {
+                  case 'rect': {
+                    const handles = [
+                      { name: 'nw', x: a.x, y: a.y },
+                      { name: 'ne', x: a.x + a.width, y: a.y },
+                      { name: 'sw', x: a.x, y: a.y + a.height },
+                      { name: 'se', x: a.x + a.width, y: a.y + a.height },
+                      { name: 'n', x: a.x + a.width / 2, y: a.y },
+                      { name: 's', x: a.x + a.width / 2, y: a.y + a.height },
+                      { name: 'w', x: a.x, y: a.y + a.height / 2 },
+                      { name: 'e', x: a.x + a.width, y: a.y + a.height / 2 },
+                    ]
+                    return (
+                      <g key={a.id}>
+                        <rect x={a.x} y={a.y} width={a.width} height={a.height} stroke={isSelected ? '#ff1744' : a.color} strokeWidth={a.borderWidth + (isSelected ? 2 : 0)} fill={a.fill || 'none'} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }} />
+                        {isSelected && handles.map((h) => (
+                          <rect
+                            key={h.name}
+                            x={h.x - 5}
+                            y={h.y - 5}
+                            width={10}
+                            height={10}
+                            fill="#fff"
+                            stroke="#1976d2"
+                            strokeWidth={2}
+                            style={{ cursor: `${h.name}-resize` }}
+                            onMouseDown={e => handleResizeMouseDown(e, h.name)}
+                          />
+                        ))}
+                      </g>
+                    )
+                  }
+                  case 'circle': {
+                    const handle = { name: 'r', x: a.cx + a.r, y: a.cy }
+                    return (
+                      <g key={a.id}>
+                        <circle cx={a.cx} cy={a.cy} r={a.r} stroke={isSelected ? '#ff1744' : a.color} strokeWidth={a.borderWidth + (isSelected ? 2 : 0)} fill={a.fill || 'none'} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }} />
+                        {isSelected && (
+                          <circle
+                            cx={handle.x}
+                            cy={handle.y}
+                            r={7}
+                            fill="#fff"
+                            stroke="#1976d2"
+                            strokeWidth={2}
+                            style={{ cursor: 'ew-resize' }}
+                            onMouseDown={e => handleResizeMouseDown(e, handle.name)}
+                          />
+                        )}
+                      </g>
+                    )
+                  }
+                  case 'line': {
+                    return (
+                      <g key={a.id}>
+                        <line x1={a.x1} y1={a.y1} x2={a.x2} y2={a.y2} stroke={isSelected ? '#ff1744' : a.color} strokeWidth={a.width + (isSelected ? 2 : 0)} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }} />
+                        {isSelected && (
+                          <>
+                            <circle
+                              cx={a.x1}
+                              cy={a.y1}
+                              r={7}
+                              fill="#fff"
+                              stroke="#1976d2"
+                              strokeWidth={2}
+                              style={{ cursor: 'pointer' }}
+                              onMouseDown={e => handleResizeMouseDown(e, 'start')}
+                            />
+                            <circle
+                              cx={a.x2}
+                              cy={a.y2}
+                              r={7}
+                              fill="#fff"
+                              stroke="#1976d2"
+                              strokeWidth={2}
+                              style={{ cursor: 'pointer' }}
+                              onMouseDown={e => handleResizeMouseDown(e, 'end')}
+                            />
+                          </>
+                        )}
+                      </g>
+                    )
+                  }
+                  case 'highlight': {
+                    const handles = [
+                      { name: 'nw', x: a.x, y: a.y },
+                      { name: 'ne', x: a.x + a.width, y: a.y },
+                      { name: 'sw', x: a.x, y: a.y + a.height },
+                      { name: 'se', x: a.x + a.width, y: a.y + a.height },
+                      { name: 'n', x: a.x + a.width / 2, y: a.y },
+                      { name: 's', x: a.x + a.width / 2, y: a.y + a.height },
+                      { name: 'w', x: a.x, y: a.y + a.height / 2 },
+                      { name: 'e', x: a.x + a.width, y: a.y + a.height / 2 },
+                    ]
+                    return (
+                      <g key={a.id}>
+                        <rect x={a.x} y={a.y} width={a.width} height={a.height} fill={a.color} opacity={a.opacity} stroke={isSelected ? '#ff1744' : 'none'} strokeWidth={isSelected ? 2 : 0} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }} />
+                        {isSelected && handles.map((h) => (
+                          <rect
+                            key={h.name}
+                            x={h.x - 5}
+                            y={h.y - 5}
+                            width={10}
+                            height={10}
+                            fill="#fff"
+                            stroke="#1976d2"
+                            strokeWidth={2}
+                            style={{ cursor: `${h.name}-resize` }}
+                            onMouseDown={e => handleResizeMouseDown(e, h.name)}
+                          />
+                        ))}
+                      </g>
+                    )
+                  }
+                  case 'draw':
+                    return <polyline key={a.id} points={a.points.map(p => `${p.x},${p.y}`).join(' ')} fill="none" stroke={isSelected ? '#ff1744' : a.color} strokeWidth={a.width + (isSelected ? 2 : 0)} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }} />
+                  case 'text':
+                    return <text key={a.id} x={a.x} y={a.y} fontSize={a.fontSize} fontFamily={a.fontFamily} fill={isSelected ? '#ff1744' : a.color} fontWeight={a.bold ? 'bold' : 'normal'} fontStyle={a.italic ? 'italic' : 'normal'} textDecoration={a.underline ? 'underline' : 'none'} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }}>{a.text}</text>
+                  case 'comment':
+                    return <g key={a.id} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }}><circle cx={a.x} cy={a.y} r={10} fill="#ff0" stroke={isSelected ? '#ff1744' : '#888'} strokeWidth={isSelected ? 3 : 1} /><title>{a.text}</title></g>
+                  case 'image': {
+                    const handles = [
+                      { name: 'nw', x: a.x, y: a.y },
+                      { name: 'ne', x: a.x + a.width, y: a.y },
+                      { name: 'sw', x: a.x, y: a.y + a.height },
+                      { name: 'se', x: a.x + a.width, y: a.y + a.height },
+                      { name: 'n', x: a.x + a.width / 2, y: a.y },
+                      { name: 's', x: a.x + a.width / 2, y: a.y + a.height },
+                      { name: 'w', x: a.x, y: a.y + a.height / 2 },
+                      { name: 'e', x: a.x + a.width, y: a.y + a.height / 2 },
+                    ]
+                    return (
+                      <g key={a.id}>
+                        <image x={a.x} y={a.y} width={a.width} height={a.height} href={a.src} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer', outline: isSelected ? '2px solid #ff1744' : 'none' }} />
+                        {isSelected && handles.map((h) => (
+                          <rect
+                            key={h.name}
+                            x={h.x - 5}
+                            y={h.y - 5}
+                            width={10}
+                            height={10}
+                            fill="#fff"
+                            stroke="#1976d2"
+                            strokeWidth={2}
+                            style={{ cursor: `${h.name}-resize` }}
+                            onMouseDown={e => handleResizeMouseDown(e, h.name)}
+                          />
+                        ))}
+                      </g>
+                    )
+                  }
+                  default:
+                    return null
+                }
+              })}
+              {/* Render active annotation while drawing (per page) */}
+              {activeTool === 'rect' && isDrawing && activeAnnotation && activeAnnotation.type === 'rect' && activeAnnotation.page === pageNum && (
+                <rect
+                  x={activeAnnotation.x}
+                  y={activeAnnotation.y}
+                  width={activeAnnotation.width}
+                  height={activeAnnotation.height}
+                  stroke={activeAnnotation.color}
+                  strokeWidth={activeAnnotation.borderWidth}
+                  fill={activeAnnotation.fill || 'none'}
+                  opacity={0.5}
+                  pointerEvents="none"
+                />
+              )}
+              {activeTool === 'draw' && isDrawing && activeAnnotation && activeAnnotation.type === 'draw' && activeAnnotation.page === pageNum && (
+                <polyline
+                  points={activeAnnotation.points.map(p => `${p.x},${p.y}`).join(' ')}
+                  fill="none"
+                  stroke={activeAnnotation.color}
+                  strokeWidth={activeAnnotation.width}
+                  opacity={0.5}
+                  pointerEvents="none"
+                />
+              )}
+              {activeTool === 'highlight' && isDrawing && activeAnnotation && activeAnnotation.type === 'highlight' && activeAnnotation.page === pageNum && (
+                <rect
+                  x={activeAnnotation.x}
+                  y={activeAnnotation.y}
+                  width={activeAnnotation.width}
+                  height={activeAnnotation.height}
+                  fill={activeAnnotation.color}
+                  opacity={0.3}
+                  pointerEvents="none"
+                />
+              )}
+              {activeTool === 'line' && isDrawing && activeAnnotation && activeAnnotation.type === 'line' && activeAnnotation.page === pageNum && (
+                <line
+                  x1={activeAnnotation.x1}
+                  y1={activeAnnotation.y1}
+                  x2={activeAnnotation.x2}
+                  y2={activeAnnotation.y2}
+                  stroke={activeAnnotation.color}
+                  strokeWidth={activeAnnotation.width}
+                  opacity={0.5}
+                  pointerEvents="none"
+                />
+              )}
+              {activeTool === 'circle' && isDrawing && activeAnnotation && activeAnnotation.type === 'circle' && activeAnnotation.page === pageNum && (
+                <circle
+                  cx={activeAnnotation.cx}
+                  cy={activeAnnotation.cy}
+                  r={activeAnnotation.r}
+                  stroke={activeAnnotation.color}
+                  strokeWidth={activeAnnotation.borderWidth}
+                  fill={activeAnnotation.fill || 'none'}
+                  opacity={0.5}
+                  pointerEvents="none"
+                />
+              )}
+            </svg>
+          </div>
+        )
+      }
+      if (!cancelled) setPageCanvases(canvases)
+    }
+    renderAllPages()
+    return () => {
+      cancelled = true
+      // Cancel all render tasks
+      Object.values(renderTasksRef.current).forEach(task => { try { task?.cancel() } catch {} })
+      renderTasksRef.current = {}
+    }
+  }, [pdfDoc, scale, rotation, viewMode])
+
+  // Continuous mode pointer event handlers (must be inside the component)
+  const handleAnnotationPointerDownContinuous = (e: React.PointerEvent, pageNum: number, viewport: any) => {
+    setCurrentPage(pageNum);
+    handleAnnotationPointerDown(e);
+  };
+  const handleAnnotationPointerMoveContinuous = (e: React.PointerEvent, pageNum: number, viewport: any) => {
+    setCurrentPage(pageNum);
+    handleAnnotationPointerMove(e);
+  };
+  const handleAnnotationPointerUpContinuous = (e: React.PointerEvent, pageNum: number, viewport: any) => {
+    setCurrentPage(pageNum);
+    handleAnnotationPointerUp(e);
+  };
+
+  // In the toolbar, allow deselecting the active tool
+  // (Assume onToolChange is passed from parent and used in the toolbar)
+  const handleToolChange = (tool: string) => {
+    if (activeTool === tool) {
+      onToolChange?.(null as any)
+    } else {
+      onToolChange?.(tool)
+    }
+  }
+
+  // Type guard for error objects with a 'name' property
+  function hasNameProperty(obj: unknown): obj is { name: string } {
+    return typeof obj === 'object' && obj !== null && 'name' in obj && typeof (obj as any).name === 'string';
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500" />
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="text-red-500">{error}</div>
+      </div>
+    )
+  }
+
+  if (!selectedPDF || !pdfDoc) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="text-gray-500">Select a PDF document to view</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="h-full bg-white flex flex-col">
+      {/* Page Navigation Controls */}
+      <div className="border-b p-4 flex items-center justify-between bg-gray-50">
+        <div className="flex items-center space-x-4">
+          {/* View Mode Controls */}
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={() => handleViewModeChange('single')}
+              className={`px-3 py-1 rounded text-sm ${
+                viewMode === 'single'
+                  ? 'bg-blue-500 text-white'
+                  : 'bg-gray-100 hover:bg-gray-200'
+              }`}
+              aria-label="Single page view"
+            >
+              Single
+            </button>
+            <button
+              onClick={() => handleViewModeChange('continuous')}
+              className={`px-3 py-1 rounded text-sm ${
+                viewMode === 'continuous'
+                  ? 'bg-blue-500 text-white'
+                  : 'bg-gray-100 hover:bg-gray-200'
+              }`}
+              aria-label="Continuous scroll view"
+            >
+              Continuous
+            </button>
+          </div>
+
+          {/* Undo/Redo Controls */}
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={undo}
+              disabled={historyIndex <= 0}
+              className={`px-3 py-1 rounded text-sm ${
+                historyIndex <= 0
+                  ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                  : 'bg-gray-500 text-white hover:bg-gray-600'
+              }`}
+              title="Undo (Ctrl+Z)"
+            >
+              ↶ Undo
+            </button>
+            <button
+              onClick={redo}
+              disabled={historyIndex >= annotationHistory.length - 1}
+              className={`px-3 py-1 rounded text-sm ${
+                historyIndex >= annotationHistory.length - 1
+                  ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                  : 'bg-gray-500 text-white hover:bg-gray-600'
+              }`}
+              title="Redo (Ctrl+Y)"
+            >
+              ↷ Redo
+            </button>
+          </div>
+
+          {/* Page Navigation */}
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={() => handlePageChange(currentPage - 1)}
+              disabled={currentPage <= 1}
+              className={`px-3 py-1 rounded text-sm ${
+                currentPage <= 1
+                  ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                  : 'bg-blue-500 text-white hover:bg-blue-600'
+              }`}
+              aria-label="Previous page"
+            >
+              Previous
+            </button>
+            <span className="text-sm text-gray-600">
+              Page {currentPage} of {totalPages}
+            </span>
+            <button
+              onClick={() => handlePageChange(currentPage + 1)}
+              disabled={currentPage >= totalPages}
+              className={`px-3 py-1 rounded text-sm ${
+                currentPage >= totalPages
+                  ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                  : 'bg-blue-500 text-white hover:bg-blue-600'
+              }`}
+              aria-label="Next page"
+            >
+              Next
+            </button>
+          </div>
+        </div>
+
+        {/* Zoom Controls */}
+        <div className="flex items-center space-x-4">
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={() => handleZoomMode('fit-width')}
+              className={`px-3 py-1 rounded text-sm ${
+                zoomMode === 'fit-width'
+                  ? 'bg-blue-500 text-white'
+                  : 'bg-gray-100 hover:bg-gray-200'
+              }`}
+              aria-label="Fit to width"
+            >
+              Fit Width
+            </button>
+            <button
+              onClick={() => handleZoomMode('fit-page')}
+              className={`px-3 py-1 rounded text-sm ${
+                zoomMode === 'fit-page'
+                  ? 'bg-blue-500 text-white'
+                  : 'bg-gray-100 hover:bg-gray-200'
+              }`}
+              aria-label="Fit to page"
+            >
+              Fit Page
+            </button>
+            <button
+              onClick={() => handleZoom(scale - 0.1)}
+              className="px-3 py-1 rounded text-sm bg-gray-100 hover:bg-gray-200"
+              aria-label="Zoom out"
+            >
+              -
+            </button>
+            <span className="text-sm text-gray-600">
+              {Math.round(scale * 100)}%
+            </span>
+            <button
+              onClick={() => handleZoom(scale + 0.1)}
+              className="px-3 py-1 rounded text-sm bg-gray-100 hover:bg-gray-200"
+              aria-label="Zoom in"
+            >
+              +
+            </button>
+          </div>
+
+          {/* Rotation Control */}
+          <button
+            onClick={() => setRotation((prev) => (prev + 90) % 360)}
+            className="px-3 py-1 rounded text-sm bg-gray-100 hover:bg-gray-200"
+            aria-label="Rotate page"
+          >
+            Rotate
+          </button>
+        </div>
+      </div>
+
+      {/* Main Content Area */}
+      <div className="flex-1 flex">
+        {/* PDF Preview */}
+        <div ref={containerRef} className="flex-1 overflow-auto p-4">
+          <div className="max-w-4xl mx-auto">
+            <div className="bg-gray-100 rounded-lg p-4 shadow-inner">
+              {/* PDF rendering area */}
+              {viewMode === 'single' && (
+                <div className="flex justify-center relative">
+                  <canvas ref={canvasRef} style={{ background: 'white', borderRadius: 8, boxShadow: '0 0 8px #ccc' }} />
+                  {/* Annotation overlay (SVG) */}
+                  <svg
+                    className="absolute top-0 left-0 w-full h-full pointer-events-auto"
+                    style={{ zIndex: 10 }}
+                    onPointerDown={handleAnnotationPointerDown}
+                    onPointerMove={handleAnnotationPointerMove}
+                    onPointerUp={handleAnnotationPointerUp}
+                  >
+                    {annotations.filter(a => a.page === currentPage).map(a => {
+                      const isSelected = a.id === selectedAnnotationId
+                      switch (a.type) {
+                        case 'rect': {
+                          const handles: { name: string; x: number; y: number }[] = [
+                            { name: 'nw', x: a.x, y: a.y },
+                            { name: 'ne', x: a.x + a.width, y: a.y },
+                            { name: 'sw', x: a.x, y: a.y + a.height },
+                            { name: 'se', x: a.x + a.width, y: a.y + a.height },
+                            { name: 'n', x: a.x + a.width / 2, y: a.y },
+                            { name: 's', x: a.x + a.width / 2, y: a.y + a.height },
+                            { name: 'w', x: a.x, y: a.y + a.height / 2 },
+                            { name: 'e', x: a.x + a.width, y: a.y + a.height / 2 },
+                          ] as { name: string; x: number; y: number }[];
+                          return (
+                            <g key={a.id}>
+                              <rect x={a.x} y={a.y} width={a.width} height={a.height} stroke={isSelected ? '#ff1744' : a.color} strokeWidth={a.borderWidth + (isSelected ? 2 : 0)} fill={a.fill || 'none'} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }} />
+                              {isSelected && handles.map((h) => (
+                                <rect
+                                  key={h.name}
+                                  x={h.x - 5}
+                                  y={h.y - 5}
+                                  width={10}
+                                  height={10}
+                                  fill="#fff"
+                                  stroke="#1976d2"
+                                  strokeWidth={2}
+                                  style={{ cursor: `${h.name}-resize` }}
+                                  onMouseDown={e => handleResizeMouseDown(e, h.name)}
+                                />
+                              ))}
+                            </g>
+                          )
+                        }
+                        case 'circle': {
+                          const handle = { name: 'r', x: a.cx + a.r, y: a.cy };
+                          return (
+                            <g key={a.id}>
+                              <circle cx={a.cx} cy={a.cy} r={a.r} stroke={isSelected ? '#ff1744' : a.color} strokeWidth={a.borderWidth + (isSelected ? 2 : 0)} fill={a.fill || 'none'} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }} />
+                              {isSelected && (
+                                <circle
+                                  cx={handle.x}
+                                  cy={handle.y}
+                                  r={7}
+                                  fill="#fff"
+                                  stroke="#1976d2"
+                                  strokeWidth={2}
+                                  style={{ cursor: 'ew-resize' }}
+                                  onMouseDown={e => handleResizeMouseDown(e, handle.name)}
+                                />
+                              )}
+                            </g>
+                          )
+                        }
+                        case 'line': {
+                          return (
+                            <g key={a.id}>
+                              <line x1={a.x1} y1={a.y1} x2={a.x2} y2={a.y2} stroke={isSelected ? '#ff1744' : a.color} strokeWidth={a.width + (isSelected ? 2 : 0)} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }} />
+                              {isSelected && (
+                                <>
+                                  <circle
+                                    cx={a.x1}
+                                    cy={a.y1}
+                                    r={7}
+                                    fill="#fff"
+                                    stroke="#1976d2"
+                                    strokeWidth={2}
+                                    style={{ cursor: 'pointer' }}
+                                    onMouseDown={e => handleResizeMouseDown(e, 'start')}
+                                  />
+                                  <circle
+                                    cx={a.x2}
+                                    cy={a.y2}
+                                    r={7}
+                                    fill="#fff"
+                                    stroke="#1976d2"
+                                    strokeWidth={2}
+                                    style={{ cursor: 'pointer' }}
+                                    onMouseDown={e => handleResizeMouseDown(e, 'end')}
+                                  />
+                                </>
+                              )}
+                            </g>
+                          )
+                        }
+                        case 'highlight': {
+                          const handles: { name: string; x: number; y: number }[] = [
+                            { name: 'nw', x: a.x, y: a.y },
+                            { name: 'ne', x: a.x + a.width, y: a.y },
+                            { name: 'sw', x: a.x, y: a.y + a.height },
+                            { name: 'se', x: a.x + a.width, y: a.y + a.height },
+                            { name: 'n', x: a.x + a.width / 2, y: a.y },
+                            { name: 's', x: a.x + a.width / 2, y: a.y + a.height },
+                            { name: 'w', x: a.x, y: a.y + a.height / 2 },
+                            { name: 'e', x: a.x + a.width, y: a.y + a.height / 2 },
+                          ] as { name: string; x: number; y: number }[];
+                          return (
+                            <g key={a.id}>
+                              <rect x={a.x} y={a.y} width={a.width} height={a.height} fill={a.color} opacity={a.opacity} stroke={isSelected ? '#ff1744' : 'none'} strokeWidth={isSelected ? 2 : 0} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }} />
+                              {isSelected && handles.map((h) => (
+                                <rect
+                                  key={h.name}
+                                  x={h.x - 5}
+                                  y={h.y - 5}
+                                  width={10}
+                                  height={10}
+                                  fill="#fff"
+                                  stroke="#1976d2"
+                                  strokeWidth={2}
+                                  style={{ cursor: `${h.name}-resize` }}
+                                  onMouseDown={e => handleResizeMouseDown(e, h.name)}
+                                />
+                              ))}
+                            </g>
+                          )
+                        }
+                        case 'draw':
+                          return <polyline key={a.id} points={a.points.map(p => `${p.x},${p.y}`).join(' ')} fill="none" stroke={isSelected ? '#ff1744' : a.color} strokeWidth={a.width + (isSelected ? 2 : 0)} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }} />
+                        case 'text':
+                          return <text key={a.id} x={a.x} y={a.y} fontSize={a.fontSize} fontFamily={a.fontFamily} fill={isSelected ? '#ff1744' : a.color} fontWeight={a.bold ? 'bold' : 'normal'} fontStyle={a.italic ? 'italic' : 'normal'} textDecoration={a.underline ? 'underline' : 'none'} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }}>{a.text}</text>
+                        case 'comment':
+                          return <g key={a.id} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer' }}><circle cx={a.x} cy={a.y} r={10} fill="#ff0" stroke={isSelected ? '#ff1744' : '#888'} strokeWidth={isSelected ? 3 : 1} /><title>{a.text}</title></g>
+                        case 'image': {
+                          const handles: { name: string; x: number; y: number }[] = [
+                            { name: 'nw', x: a.x, y: a.y },
+                            { name: 'ne', x: a.x + a.width, y: a.y },
+                            { name: 'sw', x: a.x, y: a.y + a.height },
+                            { name: 'se', x: a.x + a.width, y: a.y + a.height },
+                            { name: 'n', x: a.x + a.width / 2, y: a.y },
+                            { name: 's', x: a.x + a.width / 2, y: a.y + a.height },
+                            { name: 'w', x: a.x, y: a.y + a.height / 2 },
+                            { name: 'e', x: a.x + a.width, y: a.y + a.height / 2 },
+                          ] as { name: string; x: number; y: number }[];
+                          return (
+                            <g key={a.id}>
+                              <image x={a.x} y={a.y} width={a.width} height={a.height} href={a.src} onClick={e => handleAnnotationClick(e, a.id)} onMouseDown={e => handleAnnotationMouseDown(e, a)} style={{ cursor: isSelected ? 'move' : 'pointer', outline: isSelected ? '2px solid #ff1744' : 'none' }} />
+                              {isSelected && handles.map((h) => (
+                                <rect
+                                  key={h.name}
+                                  x={h.x - 5}
+                                  y={h.y - 5}
+                                  width={10}
+                                  height={10}
+                                  fill="#fff"
+                                  stroke="#1976d2"
+                                  strokeWidth={2}
+                                  style={{ cursor: `${h.name}-resize` }}
+                                  onMouseDown={e => handleResizeMouseDown(e, h.name)}
+                                />
+                              ))}
+                            </g>
+                          )
+                        }
+                        default:
+                          return null
+                      }
+                    })}
+                    {/* Render active annotation while drawing */}
+                    {activeTool === 'rect' && isDrawing && activeAnnotation && activeAnnotation.type === 'rect' && (
+                      <rect
+                        x={activeAnnotation.x}
+                        y={activeAnnotation.y}
+                        width={activeAnnotation.width}
+                        height={activeAnnotation.height}
+                        stroke={activeAnnotation.color}
+                        strokeWidth={activeAnnotation.borderWidth}
+                        fill={activeAnnotation.fill || 'none'}
+                        opacity={0.5}
+                        pointerEvents="none"
+                      />
+                    )}
+                    {activeTool === 'draw' && isDrawing && activeAnnotation && activeAnnotation.type === 'draw' && (
+                      <polyline
+                        points={activeAnnotation.points.map(p => `${p.x},${p.y}`).join(' ')}
+                        fill="none"
+                        stroke={activeAnnotation.color}
+                        strokeWidth={activeAnnotation.width}
+                        opacity={0.5}
+                        pointerEvents="none"
+                      />
+                    )}
+                    {activeTool === 'highlight' && isDrawing && activeAnnotation && activeAnnotation.type === 'highlight' && (
+                      <rect
+                        x={activeAnnotation.x}
+                        y={activeAnnotation.y}
+                        width={activeAnnotation.width}
+                        height={activeAnnotation.height}
+                        fill={activeAnnotation.color}
+                        opacity={0.3}
+                        pointerEvents="none"
+                      />
+                    )}
+                    {activeTool === 'line' && isDrawing && activeAnnotation && activeAnnotation.type === 'line' && (
+                      <line
+                        x1={activeAnnotation.x1}
+                        y1={activeAnnotation.y1}
+                        x2={activeAnnotation.x2}
+                        y2={activeAnnotation.y2}
+                        stroke={activeAnnotation.color}
+                        strokeWidth={activeAnnotation.width}
+                        opacity={0.5}
+                        pointerEvents="none"
+                      />
+                    )}
+                    {activeTool === 'circle' && isDrawing && activeAnnotation && activeAnnotation.type === 'circle' && (
+                      <circle
+                        cx={activeAnnotation.cx}
+                        cy={activeAnnotation.cy}
+                        r={activeAnnotation.r}
+                        stroke={activeAnnotation.color}
+                        strokeWidth={activeAnnotation.borderWidth}
+                        fill={activeAnnotation.fill || 'none'}
+                        opacity={0.5}
+                        pointerEvents="none"
+                      />
+                    )}
+                  </svg>
+                </div>
+              )}
+              {viewMode === 'continuous' && (
+                <div>{pageCanvases}</div>
+              )}
+              {viewMode === 'facing' && (
+                <div className="text-center text-gray-400 py-8">
+                  Facing mode is not implemented yet.
+                </div>
+              )}
+              {loading && (
+                <div className="mb-4">
+                  <div className="text-sm text-gray-600 mb-2">
+                    Loading PDF... {loadingProgress}%
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-2">
+                    <div
+                      className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                      style={{ width: `${loadingProgress}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+              {isOcrProcessing && (
+                <div className="mt-4">
+                  <div className="text-sm text-gray-600 mb-2">
+                    Processing images... {ocrProgress}%
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-2">
+                    <div
+                      className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                      style={{ width: `${ocrProgress}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* AI Response Panel */}
+        <div className="w-1/3 border-l p-4 overflow-auto">
+          <h3 className="text-lg font-semibold mb-4">AI Responses</h3>
+          {isProcessing && (
+            <div className="flex items-center justify-center p-4">
+              <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-500" />
+            </div>
+          )}
+          <div className="space-y-4">
+            {aiResponses.map((response, index) => (
+              <div key={index} className="bg-gray-50 rounded-lg p-4">
+                <div className="text-sm text-gray-500 mb-2">
+                  Page {response.pageNumber} • Confidence: {Math.round(response.confidence * 100)}%
+                </div>
+                <div className="whitespace-pre-wrap">{response.text}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Active Tool Indicator */}
+      <div className="border-t p-4 bg-gray-50">
+        <div className="text-sm text-gray-600">
+          Active Tool: <span className="font-medium">{activeTool}</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
